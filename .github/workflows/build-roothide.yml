@@ -1,0 +1,146 @@
+name: Build SmoothCursor (RootHide)
+
+on:
+  push:
+    branches: [ci/roothide-build]
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REV: dfd9148a9180d799cff31e891a543764ccf40d44
+  THEOS_REV: 958fea4f779943505b15b93c88bb4db8d97b346d
+  DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+  GIT_TERMINAL_PROMPT: '0'
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_INSTALL_CLEANUP: '1'
+
+jobs:
+  package:
+    name: Package RootHide on macOS
+    runs-on: macos-15
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Prepare run evidence
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REPOSITORY:$GITHUB_EVENT_NAME:$GITHUB_REF" in
+            Tsangbaby/SmoothCursor:push:refs/heads/ci/roothide-build) ;;
+            *) printf 'Unexpected build repository, event, or ref\n' >&2; exit 1 ;;
+          esac
+          out="$RUNNER_TEMP/smoothcursor-artifact"
+          mkdir "$out"
+          printf '%s\n' "THEOS=$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
+          printf '%s\n' "$GITHUB_SHA" > "$out/WORKFLOW_COMMIT.txt"
+          printf '%s\n' "$GITHUB_RUN_ID" > "$out/RUN_ID.txt"
+          printf '%s\n' "$GITHUB_RUN_ATTEMPT" > "$out/RUN_ATTEMPT.txt"
+
+      # Compile the original source commit, not the branch that transports this workflow.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Tsangbaby/SmoothCursor
+          ref: ${{ env.SOURCE_REV }}
+          persist-credentials: false
+
+      - name: Record source and toolchain
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/smoothcursor-artifact"
+          actual=$(git rev-parse HEAD)
+          test "$actual" = "$SOURCE_REV"
+          test -z "$(git status --porcelain)"
+          printf '%s\n' "$actual" > "$out/SOURCE_COMMIT.txt"
+          printf '%s\n' "$GITHUB_REPOSITORY" > "$out/SOURCE_REPOSITORY.txt"
+          {
+            test "$(uname -s)" = Darwin
+            test -d "$DEVELOPER_DIR"
+            sw_vers
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version
+            xcrun --sdk iphoneos --show-sdk-path
+          } 2>&1 | tee "$out/toolchain.log"
+
+      - name: Prepare build dependencies
+        run: |
+          set -euo pipefail
+          {
+            brew install make dpkg ldid xz
+            make_bin="$(brew --prefix make)/libexec/gnubin"
+            test -x "$make_bin/make"
+            printf '%s\n' "$make_bin" "$THEOS/bin" >> "$GITHUB_PATH"
+            command -v dpkg-deb ldid xz
+          } 2>&1 | tee "$RUNNER_TEMP/smoothcursor-artifact/dependencies.log"
+
+      - name: Prepare pinned RootHide Theos
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/smoothcursor-artifact"
+          {
+            git init "$THEOS"
+            git -C "$THEOS" fetch --depth=1 --no-tags https://github.com/roothide/theos.git "$THEOS_REV"
+            git -C "$THEOS" checkout --detach FETCH_HEAD
+            test "$(git -C "$THEOS" rev-parse HEAD)" = "$THEOS_REV"
+            git -C "$THEOS" submodule update --init --recursive --depth=1 --jobs 4
+            submodules=$(git -C "$THEOS" submodule status --recursive)
+            printf '%s\n' "$submodules"
+            if printf '%s\n' "$submodules" | grep -E '^[+U-]'; then
+              printf 'Theos submodules do not match the pinned gitlinks\n' >&2
+              exit 1
+            fi
+            test -f "$THEOS/vendor/mod/roothide/package/deb.mk"
+            printf '%s\n' "$THEOS_REV" > "$out/THEOS_COMMIT.txt"
+          } 2>&1 | tee "$out/theos-setup.log"
+
+      - name: Build RootHide package
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/smoothcursor-artifact"
+          sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+          {
+            command -v make ldid dpkg-deb
+            make -j2 package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1 INSTALL=0 SIMULATOR=0 \
+              'ARCHS=arm64 arm64e' TARGET=iphone:clang:latest:14.0 \
+              THEOS_PLATFORM_SDK_ROOT="$DEVELOPER_DIR" SYSROOT="$sdk" ISYSROOT="$sdk" \
+              THEOS_PLATFORM_DEB_COMPRESSION_TYPE=xz
+            debs=(packages/*.deb)
+            test "${#debs[@]}" -eq 1 && test -f "${debs[0]}" || exit 1
+            cp "${debs[0]}" "$out/"
+            (cd "$out" && shasum -a 256 -- *.deb > SHA256SUMS.txt)
+          } 2>&1 | tee "$out/theos-build.log"
+
+      - name: Check package metadata and payload
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/smoothcursor-artifact"
+          {
+            debs=("$out"/*.deb)
+            test "${#debs[@]}" -eq 1 && test -f "${debs[0]}" || exit 1
+            deb="${debs[0]}"
+            dpkg-deb -I "$deb"
+            test "$(dpkg-deb -f "$deb" Package)" = com.ps.smoothcursorios13
+            test "$(dpkg-deb -f "$deb" Version)" = 0.0.1
+            test "$(dpkg-deb -f "$deb" Architecture)" = iphoneos-arm64e
+            dpkg-deb -c "$deb" > "$out/dpkg-contents.txt"
+            payload="$RUNNER_TEMP/smoothcursor-payload"
+            dpkg-deb -x "$deb" "$payload"
+            test ! -e "$payload/var/jb"
+            tweak="$payload/Library/MobileSubstrate/DynamicLibraries/SmoothCursor"
+            test -f "$tweak.dylib" && test -f "$tweak.plist" || exit 1
+            plutil -lint "$tweak.plist"
+            xcrun lipo "$tweak.dylib" -verify_arch arm64 arm64e
+            xcrun lipo -archs "$tweak.dylib"
+            xcrun otool -arch all -L "$tweak.dylib"
+          } 2>&1 | tee "$out/package-check.log"
+
+      - name: Upload build evidence and package
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoothcursor-roothide-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/smoothcursor-artifact/
+          if-no-files-found: error
+          archive: true
+          retention-days: 14
